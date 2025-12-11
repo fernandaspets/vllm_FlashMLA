@@ -71,8 +71,9 @@ ext_modules.append(
             "csrc/sm90/decode/sparse_fp8/splitkv_mla.cu",
             "csrc/sm90/prefill/sparse/fwd.cu",
             "csrc/sm100/decode/sparse_fp8/splitkv_mla.cu",
-            "csrc/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu",
-            "csrc/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu",
+            "csrc/sm120/prefill/dense/fmha_cutlass_fwd_sm120.cu",
+            "csrc/sm120/prefill/sparse/fwd.cu",
+            "csrc/sm120/prefill/dense/fmha_cutlass_bwd_sm120.cu",
             "csrc/sm100/prefill/sparse/fwd.cu",
         ],
         extra_compile_args={
@@ -107,8 +108,9 @@ ext_modules.append(
     CUDAExtension(
         name="flash_mla.dense_fp8",
         sources=[
-            "csrc/sm90/decode/dense_fp8/pybind.cpp",
-            "csrc/sm90/decode/dense_fp8/flash_fwd_mla_fp8_sm90.cu",
+            "csrc/extension/sm90/dense_fp8/pybind.cpp",
+            "csrc/extension/sm90/dense_fp8/flash_fwd_mla_fp8_sm90.cu",
+            "csrc/extension/sm90/dense_fp8/flash_fwd_mla_metadata.cu",
         ],
         extra_compile_args={
             "cxx": cxx_args + get_features_args() + ["-DNO_PYBIND11=1"],

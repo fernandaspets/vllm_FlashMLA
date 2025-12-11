@@ -1,3 +1,5 @@
+#include "flash_mla.h"
+extern "C" void get_mla_metadata_func(Mla_metadata_params &params, cudaStream_t stream);
 #include <torch/extension.h>
 #include <torch/nn/functional.h>
 #include <ATen/cuda/CUDAContext.h>

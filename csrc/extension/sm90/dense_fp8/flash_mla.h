@@ -30,4 +30,4 @@ struct Mla_metadata_params {
     int fixed_overhead_num_blocks;
     int num_sm_parts;
 };
-void get_mla_metadata_func(Mla_metadata_params &params, cudaStream_t stream);
+extern "C" void get_mla_metadata_func(Mla_metadata_params &params, cudaStream_t stream);

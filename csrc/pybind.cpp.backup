@@ -21,8 +21,6 @@
 #include "sm90/prefill/sparse/fwd.h"
 #include "sm100/decode/sparse_fp8/splitkv_mla.h"
 #include "sm100/prefill/dense/interface.h"
-#include "sm120/prefill/dense/interface.h"
-#include "sm120/prefill/sparse/fwd.h"
 #include "sm100/prefill/sparse/fwd.h"
 
 #define CHECK_DEVICE(x) TORCH_CHECK(x.is_cuda(), #x " must be on CUDA")
@@ -40,12 +38,9 @@ struct Arch {
     bool is_sm100() const {
         return major == 10;
     }
-    bool is_sm120() const {
-        return major == 12;
-    }
 
     void assert_is_supported() const {
-        TORCH_CHECK(is_sm90() || is_sm100() || is_sm120(), "Only SM90 and SM100 are supported");
+        TORCH_CHECK(is_sm90() || is_sm100(), "Only SM90 and SM100 are supported");
     }
 };
 
@@ -405,9 +400,8 @@ std::vector<at::Tensor> sparse_prefill_fwd(
 ) {
     auto dprops = at::cuda::getCurrentDeviceProperties();
     bool is_sm90 = dprops->major == 9;
-    bool is_sm120 = dprops->major == 12;
     bool is_sm100 = dprops->major == 10;
-    TORCH_CHECK(is_sm90 || is_sm100 || is_sm120, "Sparse Attention Forward Kernel (sparse_prefill_fwd) is only supported on SM90, SM100 or SM120 architectures");
+    TORCH_CHECK(is_sm90 || is_sm100, "Sparse Attention Forward Kernel (sparse_prefill_fwd) is only supported on SM90 or SM100 architectures");
 
     CHECK_DEVICE(q);
     CHECK_DEVICE(kv);
@@ -466,8 +460,6 @@ std::vector<at::Tensor> sparse_prefill_fwd(
         sm90::run_fwd_kernel(params);
     } else if (is_sm100) {
         sm100::run_fwd_kernel(params);
-    } else if (is_sm120) {
-        sm120::run_fwd_kernel(params);
     } else {
         TORCH_CHECK(false, "Unknown architecture");
     }
@@ -481,8 +473,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "FlashMLA";
     m.def("get_mla_decoding_metadata", &get_mla_decoding_metadata);
     m.def("fwd_kvcache_mla", &fwd_kvcache_mla);
-    m.def("dense_prefill_fwd", &FMHACutlassSM120FwdRun);
-    m.def("dense_prefill_bwd", &FMHACutlassSM120BwdRun);
+    m.def("dense_prefill_fwd", &FMHACutlassSM100FwdRun);
+    m.def("dense_prefill_bwd", &FMHACutlassSM100BwdRun);
     m.def("sparse_prefill_fwd", &sparse_prefill_fwd);
 }
 #endif
