@@ -2,9 +2,7 @@
 /******************************************************************************
  * Copyright (c) 2024, Tri Dao.
  ******************************************************************************/
-#if defined(NO_PYBIND11) && NO_PYBIND11 == 1
-#include <torch/python.h>
-#endif
+
 
 #include <torch/nn/functional.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -20,10 +18,9 @@
 #include "sm90/prefill/sparse/fwd.h"
 #include "sm100/decode/sparse_fp8/splitkv_mla.h"
 #include "sm100/prefill/dense/interface.h"
-#include "sm100/prefill/sparse/fwd.h"
-#include "sm120/decode/sparse_fp8/splitkv_mla.h"
 #include "sm120/prefill/dense/interface.h"
 #include "sm120/prefill/sparse/fwd.h"
+#include "sm100/prefill/sparse/fwd.h"
 
 #define CHECK_DEVICE(x) TORCH_CHECK(x.is_cuda(), #x " must be on CUDA")
 #define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
@@ -476,7 +473,43 @@ std::vector<at::Tensor> sparse_prefill_fwd(
 }
 
 
+// Fix for FlashMLA bindings when NO_PYBIND11=1
+// Add this near the end of pybind.cpp before the #endif
+
+// Complete fix for FlashMLA bindings
+// Add this to the end of pybind.cpp
+
+
 #if defined(NO_PYBIND11) && NO_PYBIND11 == 1
+// When building as part of vllm with NO_PYBIND11=1
+// Use TORCH_LIBRARY and TORCH_LIBRARY_IMPL
+
+#include <torch/library.h>
+
+TORCH_LIBRARY(_flashmla_C, m) {
+    m.def("get_mla_decoding_metadata", &get_mla_decoding_metadata);
+    m.def("fwd_kvcache_mla", &fwd_kvcache_mla);
+    m.def("dense_prefill_fwd", &FMHACutlassSM120FwdRun);
+    m.def("dense_prefill_bwd", &FMHACutlassSM120BwdRun);
+    m.def("sparse_prefill_fwd", &sparse_prefill_fwd);
+}
+
+// Still need PyInit for Python module
+PyObject* PyInit__flashmla_C() {
+    static PyModuleDef module_def = {
+        PyModuleDef_HEAD_INIT,
+        "_flashmla_C",
+        "FlashMLA C++ extension",
+        -1,
+        nullptr, nullptr, nullptr, nullptr, nullptr
+    };
+    
+    PyObject* module = PyModule_Create(&module_def);
+    return module;
+}
+
+#else
+// Original pybind11 code
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "FlashMLA";
     m.def("get_mla_decoding_metadata", &get_mla_decoding_metadata);
@@ -486,3 +519,4 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("sparse_prefill_fwd", &sparse_prefill_fwd);
 }
 #endif
+
