@@ -2,6 +2,7 @@
 /******************************************************************************
  * Copyright (c) 2024, Tri Dao.
  ******************************************************************************/
+
 #if defined(NO_PYBIND11) && NO_PYBIND11 == 1
 #include <torch/python.h>
 #endif
@@ -55,6 +56,7 @@ struct DecodingAttnImplMeta {
     int fixed_overhead_num_blocks;
     int k_block_size;
 };
+
 
 DecodingAttnImplMeta get_attn_impl_meta(
     Arch arch,
@@ -119,17 +121,44 @@ DecodingAttnImplMeta get_attn_impl_meta(
         } else {
             if (is_fp8_kvcache) {
                 // FP8 MLA
-                TORCH_CHECK(false, "FP8 Dence MLA is not supported on SM100");
+                TORCH_CHECK(false, "FP8 Dense MLA is not supported on SM100");
             } else {
                 // Normal BF16 MLA
-                TORCH_CHECK(false, "BF16 Dence MLA is not supported on SM100");
+                TORCH_CHECK(false, "BF16 Dense MLA is not supported on SM100");
+            }
+        }
+    } else if (arch.is_sm120()) {
+        // SM120 kernels are copies of SM100 with minimal adjustments
+        // Feature support matrix should match SM100
+        if (is_sparse_attn) {
+            if (is_fp8_kvcache) {
+                TORCH_CHECK(h_q_.has_value());
+                int h_q = h_q_.value();
+                TORCH_CHECK(h_q % h_k == 0);
+                int s_q = num_q_tokens_per_head_k * h_k / h_q;
+                // FP8 + Sparse MLA (same as SM100)
+                return {
+                    std::max(sm_count / h_k / (cutlass::ceil_div(h_q/h_k, 64) * s_q), 1),
+                    5,
+                    64
+                };
+            } else {
+                // Sparse BF16 MLA
+                TORCH_CHECK(false, "Sparse BF16 MLA is not supported on SM120");
+            }
+        } else {
+            if (is_fp8_kvcache) {
+                // FP8 MLA
+                TORCH_CHECK(false, "FP8 Dense MLA is not supported on SM120");
+            } else {
+                // Normal BF16 MLA
+                TORCH_CHECK(false, "BF16 Dense MLA is not supported on SM120");
             }
         }
     } else {
         TORCH_CHECK(false, "Unsupported GPU architecture");
     }
 }
-
 
 std::vector<at::Tensor>
 get_mla_decoding_metadata(
@@ -366,6 +395,9 @@ fwd_kvcache_mla(
     } else if (arch.is_sm100()) {
         TORCH_CHECK(is_fp8 && is_sparse_attn, "Only FP8 + Sparse attention is supported on SM100");
         sm100::run_flash_splitkv_mla_fp8_sparse_kernel(params, stream);
+    } else if (arch.is_sm120()) {
+        TORCH_CHECK(is_fp8 && is_sparse_attn, "Only FP8 + Sparse attention is supported on SM120");
+        sm120::run_flash_splitkv_mla_fp8_sparse_kernel(params, stream);
     } else {
         TORCH_CHECK(false, "Unsupported GPU architecture");
     }
@@ -387,7 +419,6 @@ fwd_kvcache_mla(
 
     return {out, softmax_lse};
 }
-
 
 inline int int64_stride_to_int(int64_t orig_stride) {
     if (orig_stride > std::numeric_limits<int>::max()) {
@@ -482,7 +513,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("get_mla_decoding_metadata", &get_mla_decoding_metadata);
     m.def("fwd_kvcache_mla", &fwd_kvcache_mla);
     m.def("dense_prefill_fwd", &FMHACutlassSM100FwdRun);
+    m.def("dense_prefill_fwd_sm120", &FMHACutlassSM120FwdRun);
     m.def("dense_prefill_bwd", &FMHACutlassSM100BwdRun);
+    m.def("dense_prefill_bwd_sm120", &FMHACutlassSM120BwdRun);
     m.def("sparse_prefill_fwd", &sparse_prefill_fwd);
+    m.def("sparse_prefill_fwd_sm120", &sparse_prefill_fwd_sm120);
 }
 #endif
