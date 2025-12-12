@@ -41,6 +41,7 @@ def get_arch_flags():
     arch_flags = []
     if not DISABLE_SM100:
         arch_flags.extend(["-gencode", "arch=compute_100a,code=sm_100a"])
+    arch_flags.extend(["-gencode", "arch=compute_120,code=sm_120"])
     if not DISABLE_SM90:
         arch_flags.extend(["-gencode", "arch=compute_90a,code=sm_90a"])
     return arch_flags
@@ -63,19 +64,24 @@ ext_modules = []
 ext_modules.append(
     CUDAExtension(
         name="flash_mla.cuda",
-        sources=[
-            "csrc/pybind.cpp",
-            "csrc/smxx/get_mla_metadata.cu",
-            "csrc/smxx/mla_combine.cu",
-            "csrc/sm90/decode/dense/splitkv_mla.cu",
-            "csrc/sm90/decode/sparse_fp8/splitkv_mla.cu",
-            "csrc/sm90/prefill/sparse/fwd.cu",
-            "csrc/sm100/decode/sparse_fp8/splitkv_mla.cu",
-            "csrc/sm120/prefill/dense/fmha_cutlass_fwd_sm120.cu",
-            "csrc/sm120/prefill/sparse/fwd.cu",
-            "csrc/sm120/prefill/dense/fmha_cutlass_bwd_sm120.cu",
-            "csrc/sm100/prefill/sparse/fwd.cu",
-        ],
+	sources=[
+	    "csrc/pybind.cpp",
+	    "csrc/smxx/get_mla_metadata.cu",
+	    "csrc/smxx/mla_combine.cu",
+	    "csrc/sm90/decode/dense/splitkv_mla.cu",
+	    "csrc/sm90/decode/sparse_fp8/splitkv_mla.cu",
+	    "csrc/sm90/prefill/sparse/fwd.cu",
+	    "csrc/sm100/decode/sparse_fp8/splitkv_mla.cu",
+	    "csrc/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu",  # ← added
+	    "csrc/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu",  # ← added
+	    "csrc/sm100/prefill/sparse/fwd.cu",
+	    "csrc/sm120/decode/sparse_fp8/splitkv_mla.cu",
+	    "csrc/sm120/prefill/dense/fmha_cutlass_fwd_sm120.cu",
+	    "csrc/sm120/prefill/dense/fmha_cutlass_bwd_sm120.cu",
+	    "csrc/sm120/prefill/sparse/fwd.cu",
+	    "csrc/extension/sm90/dense_fp8/flash_fwd_mla_fp8_sm90.cu",
+	    "csrc/extension/sm90/dense_fp8/flash_fwd_mla_metadata.cu",
+	],
         extra_compile_args={
             "cxx": cxx_args + get_features_args() + ["-DNO_PYBIND11=1"],
             "nvcc": [

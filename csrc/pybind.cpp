@@ -22,6 +22,8 @@
 #include "sm100/decode/sparse_fp8/splitkv_mla.h"
 #include "sm100/prefill/dense/interface.h"
 #include "sm100/prefill/sparse/fwd.h"
+#include "sm120/prefill/sparse/fwd.h"
+#include "sm100/prefill/sparse/fwd.h"
 #include "sm120/decode/sparse_fp8/splitkv_mla.h"
 #include "sm120/prefill/dense/interface.h"
 #include "sm120/prefill/sparse/fwd.h"
@@ -512,11 +514,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "FlashMLA";
     m.def("get_mla_decoding_metadata", &get_mla_decoding_metadata);
     m.def("fwd_kvcache_mla", &fwd_kvcache_mla);
-    m.def("dense_prefill_fwd", &FMHACutlassSM100FwdRun);
-    m.def("dense_prefill_fwd_sm120", &FMHACutlassSM120FwdRun);
-    m.def("dense_prefill_bwd", &FMHACutlassSM100BwdRun);
-    m.def("dense_prefill_bwd_sm120", &FMHACutlassSM120BwdRun);
+    m.def("dense_prefill_fwd", &FMHACutlassSM120FwdRun);
+    m.def("dense_prefill_bwd", &FMHACutlassSM120BwdRun);
     m.def("sparse_prefill_fwd", &sparse_prefill_fwd);
-    m.def("sparse_prefill_fwd_sm120", &sparse_prefill_fwd_sm120);
 }
 #endif
