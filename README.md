@@ -1,3 +1,75 @@
+🛠️ Instructions for vLLM Users with SM120 GPUs (e.g., RTX 50-series, Pro 6000)
+Prerequisites
+
+    An SM120 GPU (Compute Capability 12.0)
+    CUDA 12.8 or higher
+    Basic Python/pip environment (eg. uv venv)
+
+Step 1: Clone and Prepare the Code
+
+Clone the sm120 ready vLLM repository:
+
+git clone https://github.com/fernandaspets/vllm_sm120.git
+cd vllm_sm120 
+
+You can also apply the patches to mainline vllm youself using the commands below. They make three key changes:
+
+    Allow attention backends to activate on SM120.
+    Update the build script (flashmla.cmake) to compile the sm120 kernels from the forked FlashMLA.
+    Fix the runtime capability check.
+
+Edit: the below sed commands might not be sufficient. clone the above vllm_sm120 fork or check the changes in there for full changelog Check all my sm120 related changes here: https://github.com/vllm-project/vllm/compare/main...fernandaspets:vllm_sm120:main
+
+# 1. Allow FlashMLA backends to recognize SM120
+sed -i 's/capability.major in \[9, 10\]/capability.major in [9, 10, 12]/' vllm/v1/attention/backends/mla/flashmla_sparse.py
+sed -i 's/capability.major in \[9, 10\]/capability.major in [9, 10, 12]/' vllm/v1/attention/backends/mla/flashmla.py
+
+# 2. Tell vLLM to build the SM120 kernels from our fork
+sed -i 's|sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu|sm120/prefill/dense/fmha_cutlass_fwd_sm120.cu|' cmake/external_projects/flashmla.cmake
+sed -i 's|sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu|sm120/prefill/dense/fmha_cutlass_bwd_sm100.cu|' cmake/external_projects/flashmla.cmake
+
+# 3. Update the runtime check function
+sed -i 's/current_platform.get_device_capability()\[0\] not in (9, 10)/current_platform.get_device_capability()[0] not in (9, 10, 12)/' vllm/attention/ops/flashmla.py
+
+Step 2: Install vLLM with Custom FlashMLA
+
+Set an environment variable to tell vLLM's build system to use this forked FlashMLA repository instead of downloading the official one:
+
+export FLASH_MLA_SRC_DIR=/path/to/your/vllm_FlashMLA
+
+    Note: Replace /path/to/your/vllm_FlashMLA with the actual absolute path to the directory where you cloned this vllm_FlashMLA repository.
+
+Install vLLM in development mode. The build process will automatically fetch and compile the custom FlashMLA from the path you specified.
+
+pip install -e . --no-build-isolation
+
+Step 3: Verify the Installation
+
+After installation, you can verify that vLLM recognizes your SM120 GPU and the FlashMLA backend:
+
+import torch
+from vllm.platforms import current_platform
+from vllm.attention.ops.flashmla import is_flashmla_sparse_supported
+
+print(f"GPU: {torch.cuda.get_device_name(0)}")
+print(f"Compute Capability: {current_platform.get_device_capability()}")
+print(f"FlashMLA Sparse Supported: {is_flashmla_sparse_supported()}")
+
+Expected output for an RTX Pro 6000:
+
+GPU: NVIDIA RTX PRO 6000 Blackwell Workstation Edition
+Compute Capability: DeviceCapability(major=12, minor=0)
+FlashMLA Sparse Supported: (True, None)
+
+⚠️ Important Limitations (SM120 vs. SM100)
+
+The port enables kernels to run on SM120, testing is required to find out what works and doesn't yet. Key hardware differences affect the design:
+
+    Shared Memory: 99 KB on SM120 vs. 228 KB on SM100. This severely limits kernel tile sizes and register usage.
+    No Tensor Memory (TMEM): Requires using Global Memory for some operations, which is slower.
+    Different MMA Units: Uses warp-level MMA instructions instead of the larger WGMMA available on SM100.
+
+
 # FlashMLA
 
 ## Introduction
