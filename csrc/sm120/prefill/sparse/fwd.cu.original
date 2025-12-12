@@ -1,8 +1,3 @@
-#include "cutlass/cutlass.h"
-#include "cutlass/arch/mma.h"
-#include "cutlass/gemm/dispatch_policy.hpp"
-#include "cutlass/gemm/collective/collective_builder.hpp"
-#include "cutlass/epilogue/collective/collective_builder.hpp"
 #include "fwd.h"
 
 #include <math_constants.h>
@@ -72,12 +67,12 @@ constexpr int D_K = 576;
 constexpr int D_V = 512;
 constexpr float MAX_INIT_VAL = -1e30;    // We use this number as the initial value for mi (max logits) to avoid -inf - (-inf) = nan
 
-constexpr int B_H = 64;    // For SM120 2 CTAs (reduced for 99KB shared mem)
-constexpr int B_TOPK = 64; // For SM120 2 CTAs (reduced for 99KB shared mem)
+constexpr int B_H = 64;    // For 2 CTAs
+constexpr int B_TOPK = 64; // For 2 CTAs
 constexpr int NUM_BUFS = 2;
-constexpr int NUM_THREADS = 128 + 128 + 64; // 128 TMA threads, 128 scale & exp threads, 32 UTCMMA threads
+constexpr int NUM_THREADS = 256 + 128 + 128; // 128 TMA threads, 128 scale & exp threads, 32 UTCMMA threads
 
-constexpr int D_sQ = 192, NUM_sQ_TILES = 3;
+constexpr int D_sQ = 256, NUM_sQ_TILES = D_sQ / 64;
 constexpr int D_tQ = D_Q - D_sQ, NUM_tQ_TILES = D_tQ / 64;
 static_assert(D_sQ%64 == 0 && D_tQ%64 == 0 && D_sQ + D_tQ == D_Q);
 
@@ -153,93 +148,53 @@ struct SharedMemoryPlan {
     float rowwise_max_buf[128], rowwise_li_buf[128];
 };
 
-// Pipeline Overview:
-// SM120 CUTLASS CollectiveBuilder configuration (from 80a example)
-#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED)
+using TiledMMA_P_tQ = decltype(make_tiled_mma(
+    SM100_MMA_F16BF16_2x1SM_TS_NOELECT<bf16, bf16, float, B_H, B_TOPK, UMMA::Major::K, UMMA::Major::K>{}
+));
 
-using ArchTag = cutlass::arch::Sm120;
-using OperatorClassSparse = cutlass::arch::OpClassBlockScaledSparseTensorOp;
+using TiledMMA_P_sQ = decltype(make_tiled_mma(
+    SM100_MMA_F16BF16_2x1SM_SS_NOELECT<bf16, bf16, float, B_H, B_TOPK, UMMA::Major::K, UMMA::Major::K>{}
+));
 
-// Element types for MXFP8->BF16 sparse (example 80a)
-using ElementA = cutlass::mx_float8_t<cutlass::float_e4m3_t>;
-using ElementB = cutlass::mx_float8_t<cutlass::float_e4m3_t>;
-using ElementC = cutlass::bfloat16_t;
-using ElementD = cutlass::bfloat16_t;
-using ElementAccumulator = float;
+using TiledMMA_O = decltype(make_tiled_mma(
+    SM100_MMA_F16BF16_2x1SM_SS_NOELECT<bf16, bf16, float, B_H, 256, UMMA::Major::K, UMMA::Major::MN>{},
+    Layout<Shape<_1, _1, _1>>{},
+    Tile<Int<128>, Layout<Shape<_128, _2, _2>, Stride<_1, _256, _128>>, _16>{}  // We use this permutation layout to let CTA0 takes V[:, 0:256] and CTA1 takes V[:, 256:512]
+));
 
-// Layouts
-using LayoutA = cutlass::layout::RowMajor;
-using LayoutB = cutlass::layout::ColumnMajor;
-using LayoutC = cutlass::layout::RowMajor;
-using LayoutD = cutlass::layout::RowMajor;
+/*
+Pipeline Overview:
 
-// Alignments (from example 80a)
-constexpr int AlignmentA = 32;
-constexpr int AlignmentB = 16;
-constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
-constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
+| Copy |    MMA    |   Scale & Exp   |
 
-// Tile shapes
-using ThreadBlockShape = Shape<_128, _128, _256>;
-using ClusterShape = Shape<_1, _1, _1>;
+K0
+V0
+        P0 = QK0^T
+K1                  S0 = exp(P0)
+                    scale(O) w.r.t P0
+        P1 = QK1^T
+K2                  S1 = exp(P1)
+        O += S0V0
+V1                  scale(O) w.r.t P1
+        P2 = QK2^T
+K3                  S2 = exp(P2)
+        O += S1V1
+V2                  scale(O) w.r.t P2
+        P3 = QK3^T
+K4                  S3 = exp(P3)
+        O += S2V2
+V3                  scale(O) w.r.t P3
 
-// Kernel schedule
-using KernelScheduleSparse = cutlass::gemm::KernelSparseTmaWarpSpecializedMxf8f6f4Acc2x4Sm120;
+...
 
-// CollectiveEpilogue
-using CollectiveEpilogueSparse = typename cutlass::epilogue::collective::CollectiveBuilder<
-    ArchTag, OperatorClassSparse,
-    ThreadBlockShape, ClusterShape,
-    cutlass::epilogue::collective::EpilogueTileAuto,
-    ElementAccumulator, ElementAccumulator,
-    ElementC, LayoutC, AlignmentC,
-    ElementD, LayoutD, AlignmentD,
-    cutlass::epilogue::collective::EpilogueScheduleAuto
-  >::CollectiveOp;
-
-// CollectiveMainloop
-using CollectiveMainloopSparse = typename cutlass::gemm::collective::CollectiveBuilder<
-    ArchTag, OperatorClassSparse,
-    ElementA, LayoutA, AlignmentA,
-    ElementB, LayoutB, AlignmentB,
-    ElementAccumulator,
-    ThreadBlockShape, ClusterShape,
-    cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename CollectiveEpilogueSparse::SharedStorage))>,
-    KernelScheduleSparse
->::CollectiveOp;
-
-#endif // CUTLASS_ARCH_MMA_SM120_SUPPORTED
-
-// | Copy |    MMA    |   Scale | Copy |    MMA    |   Scale & Exp   | Exp   |
-
-// K0
-// V0
-//         P0 = QK0^T
-// K1                  S0 = exp(P0)
-// scale(O) w.r.t P0
-//         P1 = QK1^T
-// K2                  S1 = exp(P1)
-// O += S0V0
-// V1                  scale(O) w.r.t P1
-//         P2 = QK2^T
-// K3                  S2 = exp(P2)
-// O += S1V1
-// V2                  scale(O) w.r.t P2
-//         P3 = QK3^T
-// K4                  S3 = exp(P3)
-// O += S2V2
-// V3                  scale(O) w.r.t P3
-
-// ...
-
-//         O += S(n-3)V(n-3)
-// V(n-2)              scale(O) w.r.t P(n-2)
-//         P(n-1) = QK(n-1)^T
-//                    S(n-1) = exp(P(n-1))
-//         O += S(n-2)V(n-2)
-// V(n-1)             scale(O) w.r.t P(n-1)
-//         O += S(n-1)V(n-1)
-// */
+        O += S(n-3)V(n-3)
+V(n-2)              scale(O) w.r.t P(n-2)
+        P(n-1) = QK(n-1)^T
+                   S(n-1) = exp(P(n-1))
+        O += S(n-2)V(n-2)
+V(n-1)             scale(O) w.r.t P(n-1)
+        O += S(n-1)V(n-1)
+*/
 
 template<typename TmaParams>
 __global__ void __launch_bounds__(NUM_THREADS, 1, 2)
@@ -250,7 +205,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparsePrefillParams params, __gri
     const int warp_idx = cutlass::canonical_warp_idx_sync();
     const int lane_idx = threadIdx.x % 32;
     const int num_k_blocks = params.topk / B_TOPK;
-    const int warpgroup_idx = __shfl_sync(0xffffffff, threadIdx.x / 80, 0);
+    const int warpgroup_idx = __shfl_sync(0xffffffff, threadIdx.x / 128, 0);
     const int idx_in_warpgroup = threadIdx.x % 128;
 
     // Prefetch TMA descriptors
@@ -296,9 +251,9 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparsePrefillParams params, __gri
                 plan.bar_v_part0_ready[i].init(1);
                 plan.bar_v_part1_ready[i].init(1);
                 plan.bar_p_free[i].init(128*2);
-                plan.bar_so_ready[i].init(160*2);
+                plan.bar_so_ready[i].init(128*2);
                 plan.bar_k_valid_ready[i].init(16);
-                plan.bar_k_valid_free[i].init(160);
+                plan.bar_k_valid_free[i].init(128);
             }
             fence_barrier_init();
         }
@@ -385,9 +340,9 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparsePrefillParams params, __gri
 
             plan.bar_k_valid_free[k%NUM_BUFS].arrive();
 
-            NamedBarrier::arrive_and_wait(160, 0);  // Wait for rowwise_max_buf and sP to be ready
+            NamedBarrier::arrive_and_wait(128, 0);  // Wait for rowwise_max_buf and sP to be ready
             plan.rowwise_max_buf[idx_in_warpgroup] = cur_pi_max;
-            NamedBarrier::arrive_and_wait(160, 0);  // TODO Name these barriers
+            NamedBarrier::arrive_and_wait(128, 0);  // TODO Name these barriers
             cur_pi_max = max(cur_pi_max, plan.rowwise_max_buf[idx_in_warpgroup^64]);
             real_mi = max(real_mi, cur_pi_max);
             bool should_scale_o = __any_sync(0xffffffff, cur_pi_max - mi > 6.0f);
@@ -470,7 +425,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparsePrefillParams params, __gri
         
         // Exchange li
         plan.rowwise_li_buf[idx_in_warpgroup] = li;
-        NamedBarrier::arrive_and_wait(160, 0);
+        NamedBarrier::arrive_and_wait(128, 0);
         li += plan.rowwise_li_buf[idx_in_warpgroup^64];
 
         // Store mi and li
@@ -535,7 +490,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparsePrefillParams params, __gri
 
             // Sync
             fence_view_async_shared();
-            NamedBarrier::arrive_and_wait(160, 0);
+            NamedBarrier::arrive_and_wait(128, 0);
             
             if (warp_idx == 0 && elect_one_sync()) {
                 cute::copy(
@@ -770,7 +725,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparsePrefillParams params, __gri
 void run_fwd_kernel(const SparsePrefillParams& params) {
     FLASH_ASSERT(params.h_kv == 1);
     FLASH_ASSERT(params.topk % B_TOPK == 0);   // To save some boundry checkings
-    FLASH_ASSERT(params.h_q % B_H == 0); // Must be divisible for multi-iteration  // To save some calculation
+    FLASH_ASSERT(params.h_q == B_H);  // To save some calculation
 
     auto shape_Q = make_shape(params.h_q, params.d_qk, params.s_q);
     auto tma_Q = cute::make_tma_copy(
@@ -835,7 +790,7 @@ void run_fwd_kernel(const SparsePrefillParams& params) {
     CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
     cutlass::ClusterLaunchParams launch_params = {
-        dim3(2 * params.s_q * ((params.h_q + B_H - 1) / B_H), 1, 1),
+        dim3(2*params.s_q, 1, 1),
         dim3(NUM_THREADS, 1, 1),
         dim3(2, 1, 1),
         smem_size,

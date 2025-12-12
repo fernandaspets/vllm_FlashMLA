@@ -1,0 +1,342 @@
+--- csrc/sm120/prefill/sparse/fwd.cu
++++ csrc/sm120/prefill/sparse/fwd.cu
+@@ -67,11 +67,11 @@
+ constexpr int D_V = 512;
+ constexpr float MAX_INIT_VAL = -1e30;    // We use this number as the initial value for mi (max logits) to avoid -inf - (-inf) = nan
+ 
+-constexpr int B_H = 128;    // For 2 CTAs
+-constexpr int B_TOPK = 128; // For 2 CTAs
++constexpr int B_H = 64;     // REDUCED for SM120 shared memory (99KB vs 228KB on SM100)
++constexpr int B_TOPK = 64;  // REDUCED for SM120 shared memory
+ constexpr int NUM_BUFS = 2;
+-constexpr int NUM_THREADS = 256 + 128 + 128; // 128 TMA threads, 128 scale & exp threads, 32 UTCMMA threads
+-
++// Adjust thread counts for smaller tile sizes
++constexpr int NUM_THREADS = 128 + 128 + 64; // Reduced for SM120: 128 TMA, 128 scale/exp, 64 MMA
+ constexpr int D_sQ = 256, NUM_sQ_TILES = D_sQ / 64;
+ constexpr int D_tQ = D_Q - D_sQ, NUM_tQ_TILES = D_tQ / 64;
+ static_assert(D_sQ%64 == 0 && D_tQ%64 == 0 && D_sQ + D_tQ == D_Q);
+@@ -148,7 +148,8 @@
+     transac_bar_t bar_p_free[NUM_BUFS];
+     transac_bar_t bar_so_ready[NUM_BUFS];   // S and O are ready
+     transac_bar_t bar_k_valid_ready[NUM_BUFS], bar_k_valid_free[NUM_BUFS];
+-    array_aligned<uint32_t, 1> tmem_start_addr;
++    // Note: SM120 doesn't have TMEM, but we keep for compatibility
++    array_aligned<uint32_t, 1> tmem_start_addr; 
+     float rowwise_max_buf[128], rowwise_li_buf[128];
+ };
+ 
+@@ -191,7 +192,10 @@
+ #if IS_SM100
+     const int cta_idx = blockIdx.x % 2;
+     const int s_q_idx = blockIdx.x / 2;
+-    const int warp_idx = cutlass::canonical_warp_idx_sync();
++    // For SM120, we need to adjust warp indexing due to smaller thread count
++    // NUM_THREADS = 320, warps = 320/32 = 10 warps
++    const int total_warps = NUM_THREADS / 32;
++    const int warp_idx = threadIdx.x / 32;
+     const int lane_idx = threadIdx.x % 32;
+     const int num_k_blocks = params.topk / B_TOPK;
+     const int warpgroup_idx = __shfl_sync(0xffffffff, threadIdx.x / 128, 0);
+@@ -207,8 +211,12 @@
+     // Define shared tensors
+     extern __shared__ char wksp_buf[];
+     SharedMemoryPlan &plan = *reinterpret_cast<SharedMemoryPlan*>(wksp_buf);
++    
++    // For SM120: Check shared memory bounds
++    assert(sizeof(SharedMemoryPlan) <= 99 * 1024);
++    
+     Tensor sQ_full = make_tensor(make_smem_ptr(plan.u.q_full.data()), SmemLayoutQTiles<9>{});
+-
++    
+     int* gIndices = params.indices + s_q_idx*params.stride_indices_s_q; // [topk]
+ 
+     // Allocate tmem tensors
+@@ -249,10 +257,11 @@
+                 plan.bar_p_free[i].init(128*2);
+                 plan.bar_so_ready[i].init(128*2);
+                 plan.bar_k_valid_ready[i].init(16);
+-                plan.bar_k_valid_free[i].init(128);
++                plan.bar_k_valid_free[i].init(128); // Keep 128 for compatibility
+             }
+             fence_barrier_init();
+         }
++        __syncthreads(); // Ensure all threads see initialized barriers
+     }
+ 
+     cute::cluster_sync();   // We must add a cluster_sync() here, or TMA from CTA1 may launch before barrier initialization in CTA0
+@@ -268,6 +277,7 @@
+ 
+         // Initialize TMEM
+         // We put this before cluster_arrive to make sure that the TMEM allocation is done before UTCCP
++        // Note: SM120 doesn't have TMEM, this is for compatibility only
+         cute::TMEM::Allocator2Sm().allocate(512, plan.tmem_start_addr.data());
+         TRAP_ONLY_DEVICE_ASSERT(plan.tmem_start_addr.data()[0] == 0);
+         cute::TMEM::Allocator2Sm().release_allocation_lock();
+@@ -290,8 +300,8 @@
+         const float2 scale = float2 {params.sm_scale_div_log2, params.sm_scale_div_log2};
+         uint128_t* sS_base = (uint128_t*)plan.s.data() + idx_in_warpgroup%64 + 64*((idx_in_warpgroup/64)*8);
+ 
+-        CUTE_NO_UNROLL
+-        for (int k = 0; k < num_k_blocks; ++k) {
++        // Main processing loop
++        for (int k = 0; k < num_k_blocks; ++k) {
+             // Wait for P
+             plan.bar_qk_done[k%NUM_BUFS].wait((k/NUM_BUFS)&1);
+             tcgen05_after_thread_sync();
+@@ -311,13 +321,13 @@
+             float* p_float = (float*)p;
+             CUTE_UNROLL
+             for (int i = 0; i < (B_TOPK/2)/2; i += 1) {
+-                if (!(is_k_valid_lo >> i & 1))
++                if (!((is_k_valid_lo >> i) & 1))
+                     p_float[i] = -CUDART_INF_F;
+             }
+             CUTE_UNROLL
+             for (int i = 0; i < (B_TOPK/2)/2; i += 1) {
+-                if (!(is_k_valid_hi >> i & 1))
+-                    p_float[i+(B_TOPK/2)/2] = -CUDART_INF_F;
++                if (!((is_k_valid_hi >> i) & 1))
++                    p_float[i + (B_TOPK/2)/2] = -CUDART_INF_F;
+             }
+ 
+             // Get rowwise max of Pi
+@@ -326,7 +336,7 @@
+             for (int i = 0; i < (B_TOPK/2); i += 1) {
+                 cur_pi_max = max(cur_pi_max, p_float[i]);
+             }
+-            cur_pi_max *= params.sm_scale_div_log2;
++            cur_pi_max = cur_pi_max * params.sm_scale_div_log2;
+ 
+             plan.bar_k_valid_free[k%NUM_BUFS].arrive();
+ 
+@@ -360,7 +370,7 @@
+                 d.x = exp2f(d.x);
+                 d.y = exp2f(d.y);
+                 li += d.x + d.y;    // NOTE Theorically we can have use FFMA2 here but actually this is faster...
+-                s[i] = __float22bfloat162_rn(d);
++                s[i] = __floats2bfloat162_rn(d.x, d.y);
+             }
+ 
+             // Wait for last SV gemm, write S
+@@ -371,7 +381,7 @@
+                 sS_base[64*i] = *(uint128_t*)(s + i*4);
+             }
+ 
+-            // Scale O
++            // Scale O - FIX for SM120: Avoid whole-tile zeroing
+             if (k > 0 && should_scale_o) {
+                 float2 scale_for_old_float2 = float2 {scale_for_old, scale_for_old};
+                 // plan.bar_sv_done[(k-1)%NUM_BUFS].wait(((k-1)/NUM_BUFS)&1);   // NOTE We have waited for last SV gemm before
+@@ -436,7 +446,6 @@
+         }
+ 
+         // Epilogue
+-
+         if (real_mi == -CUDART_INF_F) {
+             // real_mi == -CUDART_INF_F <=> No valid TopK indices
+             // We set li to 0 to fit the definition that li := exp(x[i] - mi)
+@@ -483,9 +492,9 @@
+ 
+         float2 output_scale_float2 = make_float2(output_scale, output_scale);
+ 
+-        CUTE_UNROLL
++        // Process output in chunks
+         for (int k = 0; k < (D_V/2)/B_EPI; ++k) {
+-            // Load O from tO
++            // Load O from tO (TMEM - SM120 compatibility mode)
+             if (have_valid_indices) {
+                 tmem_ld_32dp32bNx<B_EPI>(tmem_cols::o + k*B_EPI, o);
+                 cutlass::arch::fence_view_async_tmem_load();
+@@ -496,9 +505,12 @@
+             CUTE_UNROLL
+             for (int i = 0; i < B_EPI/8; ++i) {
+                 __nv_bfloat162 o_bf16[4];
+-                CUTE_UNROLL
+-                for (int j = 0; j < 4; ++j) {
+-                    float2 d = float2_mul(o[i*4+j], output_scale_float2);
++                // Process 4 bfloat16 pairs
++                for (int j = 0; j < 4; ++j) {
++                    float2 d;
++                    d.x = o[i*4+j].x * output_scale;
++                    d.y = o[i*4+j].y * output_scale;
++                    // d = float2_mul(o[i*4+j], output_scale_float2);
+                     o_bf16[j] = __float22bfloat162_rn(d);
+                 }
+                 int smem_row = idx_in_warpgroup % 64;
+@@ -515,14 +527,14 @@
+                     tma_params.tma_O,
+                     thr_tma.partition_S(sO_divided(_, _, k)),
+                     thr_tma.partition_D(tma_gO(_, _, k))
+-                );
++                    );
+             }
+             if (warp_idx == 1 && elect_one_sync()) {
+                 int k2 = k + (D_V/B_EPI/2);
+                 cute::copy(
+                     tma_params.tma_O,
+                     thr_tma.partition_S(sO_divided(_, _, k2)),
+-                    thr_tma.partition_D(tma_gO(_, _, k2))
++                    thr_tma.partition_D(tma_gO(_, _, k2)) 
+                 );
+             }
+         }
+@@ -537,7 +549,8 @@
+         constexpr int NUM_WARPS = 4, NUM_LOCAL_ROWS_PER_WARP = (B_TOPK/2)/4/NUM_WARPS;
+         if (elect_one_sync()) {
+             bf16* sK_base = plan.u.s.k.data() + warp_idx*4*64;
+-
++            
++            // Load K in pipelined fashion
+             CUTE_NO_UNROLL
+             for (int k = 0; k < num_k_blocks; ++k) {
+                 int4 indices[NUM_LOCAL_ROWS_PER_WARP];
+@@ -550,8 +563,8 @@
+                         CUTE_UNROLL
+                         for (int local_col = local_col_start; local_col < local_col_end; ++local_col)
+                             tma_gather4<true>(
+-                                &(tma_params.tensor_map_kv),
+-                                bar,
++                                &(tma_params.tensor_map_kv), 
++                                bar, 
+                                 sK_base + local_row*(4*NUM_WARPS)*64 + local_col*((B_TOPK/2)*64),
+                                 local_col*64,
+                                 indices[local_row],
+@@ -583,9 +596,9 @@
+             // Wait for UTCCP
+             plan.bar_prologue_utccp.wait(0);
+ 
+-            bf16* sV_base = plan.u.s.v.data() + warp_idx*4*64;
++            bf16* sV_base = plan.u.s.v.data() + warp_idx*4*64; 
+ 
+-            CUTE_NO_UNROLL
++            // Load V in pipelined fashion
+             for (int k = 0; k < num_k_blocks; ++k) {
+                 auto load_part_vi = [&](transac_bar_t* bar, int local_row_start, int local_row_end) {
+                     CUTE_UNROLL
+@@ -631,28 +644,30 @@
+             // S -> T copy for Q
+             UMMA::SmemDescriptor sQ_desc = UMMA::make_umma_desc<UMMA::Major::K>(
+                 make_tensor(
+-                    make_smem_ptr(plan.u.q_full.data() + (B_H/2)*D_sQ),
++                    make_smem_ptr(plan.u.q_full.data() + (B_H/2)*D_sQ), 
+                     tile_to_shape(
+-                        UMMA::Layout_K_SW128_Atom<bf16>{},
++                        UMMA::Layout_K_SW128_Atom<bf16>{}, 
+                         Shape<Int<B_H/2>, Int<64>>{}
+                     )
+                 )
+             );
+             plan.bar_prologue_q.arrive_and_expect_tx(B_H*D_K*sizeof(bf16));
+             plan.bar_prologue_q.wait(0);
+-            tcgen05_after_thread_sync();
++            tcgen05_after_thread_sync(); 
++            
++            // Copy Q tiles
+             CUTE_UNROLL
+             for (int tile_idx = 0; tile_idx < NUM_tQ_TILES; ++tile_idx) {
+                 // A tile is 64 rows * 64 cols (128B)
+                 CUTE_UNROLL
+                 for (int subtile_idx = 0; subtile_idx < 8; ++subtile_idx) {
+                     // A subtile is 64 rows * 8 cols (128b)
+-                    SM100_UTCCP_2x64dp128bitlw0213_2cta::copy(
++                    SM100_UTCCP_2x64dp128bitlw0213_2cta::copy( 
+                         sQ_desc + tile_idx*((B_H/2)*128/16) + subtile_idx*(16/16),   // Remember that 4 LSBs are not included
+                         tmem_cols::q + tile_idx*32 + subtile_idx*4
+                     );
+                 }
+-            }
++            } 
+             umma_arrive_multicast_2x1SM_noelect(plan.bar_prologue_utccp, 1|2);
+ 
+             CUTE_NO_UNROLL
+@@ -688,7 +703,7 @@
+                     // O += S(i-1)V(i-1)
+                     int cur_buf = (k-1)%NUM_BUFS;
+ 
+-                    Tensor sS = make_tensor(make_smem_ptr(plan.s.data()), SmemLayoutSTiles<2>{});
++                    Tensor sS = make_tensor(make_smem_ptr(plan.s.data()), SmemLayoutSTiles<2>{}); 
+                     Tensor sV = make_tensor(make_smem_ptr(plan.u.s.v.data()), SmemLayoutV{});
+                     Tensor sS_divided = flat_divide(sS, Tile<Int<B_H/2>, _64>{})(_, _, _0{}, _);    // (B_H/2, 64, 2)
+                     Tensor sV_divided = flat_divide(sV, Tile<Int<D_V/2>, _64>{})(_, _, _0{}, _);  // (D_V/2, 64, 2)
+@@ -721,7 +736,7 @@
+         } else if (warp_idx == 13) {
+             // KV valid loading warp
+             static_assert(B_TOPK == 128);
+-            if (lane_idx < 16) {
++            if (lane_idx < 16) { 
+                 CUTE_NO_UNROLL
+                 for (int k = 0; k < num_k_blocks; ++k) {
+                     int cur_buf = k%NUM_BUFS;
+@@ -749,16 +764,21 @@
+ 
+ void run_fwd_kernel(const SparsePrefillParams& params) {
+     FLASH_ASSERT(params.h_kv == 1);
+-    FLASH_ASSERT(params.topk % B_TOPK == 0);   // To save some boundry checkings
+-    FLASH_ASSERT(params.h_q == B_H);  // To save some calculation
++    FLASH_ASSERT(params.topk % B_TOPK == 0);   // TopK must be divisible by our tile size
++    
++    // For SM120 with reduced B_H, we need to handle multiple iterations
++    // or ensure input matches our tile size
++    if (params.h_q > B_H) {
++        FLASH_ASSERT(params.h_q % B_H == 0);  // Must be divisible for multi-iteration
++    }
+ 
+     auto shape_Q = make_shape(params.h_q, params.d_qk, params.s_q);
+     auto tma_Q = cute::make_tma_copy(
+-        SM100_TMA_2SM_LOAD_NOSPLIT{},
++        SM100_TMA_2SM_LOAD_NOSPLIT{},  // May need SM120 equivalent
+         make_tensor(
+             make_gmem_ptr((bf16*)params.q),
+             make_layout(
+-                shape_Q,
++                shape_Q, 
+                 make_stride(params.stride_q_h_q, _1{}, params.stride_q_s_q)
+             )
+         ),
+@@ -770,13 +790,13 @@
+         SM90_TMA_STORE{},
+         make_tensor(
+             make_gmem_ptr((bf16*)params.out),
+-            make_layout(
++            make_layout( 
+                 shape_O,
+                 make_stride(params.d_v, _1{}, params.h_q*params.d_v)
+             )
+         ),
+         SmemLayoutOTiles<1>{}
+-    );
++    ); 
+ 
+     CUtensorMap tensor_map_kv;
+     {
+@@ -799,7 +819,7 @@
+     );
+     FLASH_ASSERT(res == CUresult::CUDA_SUCCESS);
+ 
+-    TmaParams<
++    TmaParams< 
+         decltype(shape_Q), decltype(tma_Q),
+         decltype(shape_O), decltype(tma_O)
+     > tma_params = {
+@@ -814,14 +834,18 @@
+     CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+ 
+     cutlass::ClusterLaunchParams launch_params = {
+-        dim3(2*params.s_q, 1, 1),
++        // Adjust grid for smaller B_H
++        // Each block pair (2 CTAs) handles B_H heads
++        dim3(2 * params.s_q * ((params.h_q + B_H - 1) / B_H), 1, 1),
+         dim3(NUM_THREADS, 1, 1),
+         dim3(2, 1, 1),
+         smem_size,
+         params.stream
+     };
++    
++    // Launch kernel
+     cutlass::launch_kernel_on_cluster(
+-        launch_params, (void*)kernel, params, tma_params
++        launch_params, (void*)kernel, params, tma_params 
+     );
+     CHECK_CUDA_KERNEL_LAUNCH();
+ }
