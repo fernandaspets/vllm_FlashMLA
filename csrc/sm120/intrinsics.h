@@ -1,7 +1,7 @@
 #pragma once
 
 #include <cute/tensor.hpp>
-#include <cute/arch/simd_sm120.hpp>
+#include <cute/arch/mma_sm120.hpp>
 
 #include "defines.h"
 
@@ -456,6 +456,7 @@ CUTE_DEVICE
 T* get_peer_addr(const T* p) {
     return (T*)((int64_t)(p) ^ PEER_ADDR_MASK);
 }
+
 
 
 }

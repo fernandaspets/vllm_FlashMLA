@@ -35,7 +35,7 @@
 #include "cutlass/cutlass.h"
 
 #include "cute/tensor.hpp"
-#include "cute/arch/simd_sm120.hpp"
+#include "cute/arch/mma_sm120.hpp"
 
 #include "cutlass/arch/arch.h"
 #include "cutlass/arch/memory_sm80.h"

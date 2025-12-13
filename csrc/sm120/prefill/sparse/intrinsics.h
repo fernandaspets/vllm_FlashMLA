@@ -1,7 +1,7 @@
 #pragma once
 
 #include <cute/tensor.hpp>
-#include "defines.h"
+#include "../../defines.h"
 
 namespace sm120 {
 

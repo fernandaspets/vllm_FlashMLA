@@ -64,3 +64,11 @@ do { \
 #endif
 
 #endif  // defined(__CLION_IDE__) || defined(__VSCODE_IDE__)
+// SM120 (Blackwell) architecture detection
+#if defined(__CLION_IDE__) || defined(__VSCODE_IDE__)
+#define IS_SM120 1
+#elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1200)
+#define IS_SM120 1
+#else
+#define IS_SM120 0
+#endif
