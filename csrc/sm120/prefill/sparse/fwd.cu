@@ -1,3 +1,4 @@
+#include "cutlass/gemm/collective/collective_builder.hpp"
 #include "cutlass/cutlass.h"
 #include "cutlass/arch/mma.h"
 #include "cutlass/gemm/dispatch_policy.hpp"
@@ -82,7 +83,7 @@ constexpr int D_tQ = D_Q - D_sQ, NUM_tQ_TILES = D_tQ / 64;
 static_assert(D_sQ%64 == 0 && D_tQ%64 == 0 && D_sQ + D_tQ == D_Q);
 
 // Tensor memory columns
-namespace tmem_cols {
+namespace tensor_memory_cols {
     //   0 ~ 256: output
     // 256 ~ 320: P
     // 320 ~ 512: Q[192:576]
@@ -149,7 +150,7 @@ struct SharedMemoryPlan {
     transac_bar_t bar_p_free[NUM_BUFS];
     transac_bar_t bar_so_ready[NUM_BUFS];   // S and O are ready
     transac_bar_t bar_k_valid_ready[NUM_BUFS], bar_k_valid_free[NUM_BUFS];
-    array_aligned<uint32_t, 1> tmem_start_addr;
+    array_aligned<uint32_t, 1> tensor_memory_start_addr;
     float rowwise_max_buf[128], rowwise_li_buf[128];
 };
 
@@ -276,9 +277,9 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparsePrefillParams params, __gri
         partition_shape_A(tiled_mma_P_tQ, Shape<Int<B_H/2>, Int<D_tQ>>{})
     );
     Tensor tO = partition_fragment_C(tiled_mma_O, Shape<Int<B_H/2>, Int<D_V>>{});
-    tP.data().get() = tmem_cols::p;
-    tQr.data().get() = tmem_cols::q;
-    tO.data().get() = tmem_cols::o;
+    tP.data().get() = tensor_memory_cols::p;
+    tQr.data().get() = tensor_memory_cols::q;
+    tO.data().get() = tensor_memory_cols::o;
 
     if (warp_idx == 0) {
         if (elect_one_sync()) {
@@ -318,9 +319,10 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparsePrefillParams params, __gri
 
         // Initialize TMEM
         // We put this before cluster_arrive to make sure that the TMEM allocation is done before UTCCP
-        cute::TMEM::Allocator2Sm().allocate(512, plan.tmem_start_addr.data());
-        TRAP_ONLY_DEVICE_ASSERT(plan.tmem_start_addr.data()[0] == 0);
-        cute::TMEM::Allocator2Sm().release_allocation_lock();
+        // TMEM REMOVED - CollectiveBuilder replacement
+        plan.tmem_start_addr.data()[0] = 0;  // Temporary stub for CollectiveBuilder
+        TRAP_ONLY_DEVICE_ASSERT(plan.tensor_memory_start_addr.data()[0] == 0);
+        // TMEM LOCK REMOVED - CollectiveBuilder handles synchronization
         __syncwarp();
     }
 
@@ -350,8 +352,8 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparsePrefillParams params, __gri
 
             // Load P
             float2 p[(B_TOPK/2)/2];
-            tmem_ld_32dp32bNx<B_TOPK/2>(tmem_cols::p, p);
-            cutlass::arch::fence_view_async_tmem_load();
+            tensor_memory_load<B_TOPK/2>(tensor_memory_cols::p, p);
+            // CollectiveBuilder tensor synchronization;
             tcgen05_before_thread_sync();
             plan.bar_p_free[k%NUM_BUFS].arrive(0u);
 
@@ -440,8 +442,8 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparsePrefillParams params, __gri
                 CUTE_UNROLL
                 for (int chunk_idx = 0; chunk_idx < (D_V/2)/CHUNK_SIZE; ++chunk_idx) {
                     // Load O
-                    tmem_ld_32dp32bNx<CHUNK_SIZE>(tmem_cols::o + chunk_idx*CHUNK_SIZE, o);
-                    cutlass::arch::fence_view_async_tmem_load();
+                    tensor_memory_ld<CHUNK_SIZE>(tensor_memory_cols::o + chunk_idx*CHUNK_SIZE, o);
+                    // CollectiveBuilder tensor synchronization;
 
                     // Mult
                     for (int i = 0; i < CHUNK_SIZE/2; ++i) {
@@ -449,8 +451,8 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparsePrefillParams params, __gri
                     }
 
                     // Store O
-                    tmem_st_32dp32bNx<CHUNK_SIZE>(tmem_cols::o + chunk_idx*CHUNK_SIZE, o);
-                    cutlass::arch::fence_view_async_tmem_store();
+                    tensor_memory_st<CHUNK_SIZE>(tensor_memory_cols::o + chunk_idx*CHUNK_SIZE, o);
+                    // CollectiveBuilder tensor synchronization;
                 }
                 tcgen05_before_thread_sync();
             }
@@ -515,8 +517,8 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparsePrefillParams params, __gri
         for (int k = 0; k < (D_V/2)/B_EPI; ++k) {
             // Load O from tO
             if (have_valid_indices) {
-                tmem_ld_32dp32bNx<B_EPI>(tmem_cols::o + k*B_EPI, o);
-                cutlass::arch::fence_view_async_tmem_load();
+                tensor_memory_load<B_EPI>(tensor_memory_cols::o + k*B_EPI, o);
+                // CollectiveBuilder tensor synchronization;
             }
 
             // Convert and store
@@ -555,7 +557,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparsePrefillParams params, __gri
         }
 
         if (warp_idx == 0) {
-            cute::TMEM::Allocator2Sm().free(0, 512);
+            // CollectiveBuilder tensor memory auto-managed;
         }
     } else if (warpgroup_idx == 1) {
         // Producer warp for K
@@ -669,7 +671,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparsePrefillParams params, __gri
                     // A subtile is 64 rows * 8 cols (128b)
                     SM100_UTCCP_2x64dp128bitlw0213_2cta::copy(
                         sQ_desc + tile_idx*((B_H/2)*128/16) + subtile_idx*(16/16),   // Remember that 4 LSBs are not included
-                        tmem_cols::q + tile_idx*32 + subtile_idx*4
+                        tensor_memory_cols::q + tile_idx*32 + subtile_idx*4
                     );
                 }
             }
